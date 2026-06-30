@@ -44,7 +44,7 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.error import TelegramError
+from telegram.error import TelegramError, Conflict
 
 import db
 
@@ -68,7 +68,7 @@ OWNER_ID = int(_owner_id_raw) if _owner_id_raw.isdigit() else None
 # الحالات اللي بنعتبرها "عضو نشط فعليا" داخل القناة
 ACTIVE_STATUSES = {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
 LEFT_STATUSES = {ChatMemberStatus.LEFT}
-KICKED_STATUSES = {ChatMemberStatus.KICKED}
+KICKED_STATUSES = {ChatMemberStatus.BANNED}
 
 # عدد العناصر في كل صفحة للقوائم المختلفة (pagination حقيقي)
 CHANNELS_PER_PAGE = 8
@@ -409,6 +409,13 @@ async def handle_chat_member_update(update: Update, context: ContextTypes.DEFAUL
     # حالة 3: عضو اتطرد بالفعل (kicked) بمعرفة حد تاني أو البوت نفسه — بنسجل بس،
     # ده مش حظر بقرار البوت فمنسجلوش كـ ban_reason معروف ولا بيدخل rate limit.
     if new_status in KICKED_STATUSES and old_status not in KICKED_STATUSES:
+        # ⚠️ لو البوت هو اللي حظر العضو ده للتو (عبر execute_ban)، تيليجرام بيبعت
+        # update تاني لنفس الحدث (status -> kicked) بيوصل هنا كمان. لازم نتجاهله
+        # وإلا هيكتب فوق ban_reason الصحيح (quick_leave/watch_expired) بـ "manual"
+        # ويضيف حدث حظر مكرر في events_log. نتأكد إن العضو مش متسجل "banned" بالفعل.
+        member_row = db.get_member(channel_id, user_id)
+        if member_row and member_row["status"] == "banned":
+            return
         db.mark_member_banned(channel_id, user_id, reason=db.BAN_REASON_MANUAL)
         logger.info(f"[{channel_id}] تسجيل حظر/طرد خارجي: {format_user_label(username, full_name, user_id)}")
         return
@@ -441,11 +448,14 @@ async def check_expired_watch_periods_job(context: ContextTypes.DEFAULT_TYPE):
             # نسيبها في الجدول لحد ما يتفك الإيقاف — هتتحظر في الفحص التالي
             continue
 
-        await execute_ban(
+        ok = await execute_ban(
             context, channel_id, user_id, row["username"], row["full_name"],
             reason=db.BAN_REASON_WATCH_EXPIRED, is_automatic=True,
         )
-        db.clear_watch_period(channel_id, user_id)
+        if ok:
+            db.clear_watch_period(channel_id, user_id)
+        # لو فشل الحظر (مثلاً البوت فقد صلاحياته في القناة)، نسيب الصف في الجدول
+        # عمداً عشان نعاود المحاولة في الفحص التالي بدل ما العضو يفلت تماماً.
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +486,7 @@ async def handle_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TY
         await send_welcome_to_channel(context, channel_id)
         await send_link_notifications(context, channel_id, owner_id, chat.title)
 
-    elif new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.LEFT, ChatMemberStatus.KICKED):
+    elif new_status in (ChatMemberStatus.MEMBER, ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
         db.deactivate_channel(channel_id)
         logger.info(f"تم إلغاء تفعيل قناة: {channel_id} (البوت لم يعد أدمن)")
 
@@ -541,6 +551,9 @@ def build_link_channel_keyboard() -> ReplyKeyboardMarkup:
         can_promote_members=False,
         can_change_info=False,
         can_invite_users=False,
+        can_post_stories=False,
+        can_edit_stories=False,
+        can_delete_stories=False,
         can_post_messages=True,
         can_edit_messages=False,
         can_pin_messages=False,
@@ -699,12 +712,32 @@ async def show_bot_wide_stats(query, user_id: int):
     await query.edit_message_text(text, reply_markup=keyboard, parse_mode=ParseMode.MARKDOWN_V2)
 
 
+# أعلام "انتظار إدخال" المتنافسة في user_data — كل واحد منها بيخلي الرسالة/الصورة
+# الجاية تتفسر كإدخال لـ flow معين. لازم تتمسح كلها قبل ما نبدأ flow جديد، وإلا لو
+# المستخدم بدأ flow وسابه نص، وبدأ flow تاني، هيتفسر إدخاله الجديد حسب ترتيب
+# الفحص في handle_private_text/handle_private_photo مش حسب آخر زرار ضغطه فعلاً.
+_AWAITING_FLAG_KEYS = (
+    "_awaiting_wladd_for",
+    "_awaiting_local_search_for",
+    "_awaiting_global_search",
+    "_awaiting_broadcast_content",
+    "_awaiting_welcome_photo_for",
+    "_awaiting_default_welcome_photo",
+)
+
+
+def _clear_awaiting_flags(context):
+    for key in _AWAITING_FLAG_KEYS:
+        context.user_data.pop(key, None)
+
+
 # --- ب) بث إعلانات جماعي — يتطلب معاينة وتأكيد صريح من المطوّر قبل الإرسال ---
 
 async def start_broadcast_flow(query, context, user_id: int):
     if not is_super_owner(user_id):
         await query.answer("غير مصرح.", show_alert=True)
         return
+    _clear_awaiting_flags(context)
     context.user_data["_awaiting_broadcast_content"] = True
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data=build_cb("devpanel"))]])
     await query.edit_message_text(
@@ -796,6 +829,7 @@ async def start_global_search_flow(query, context, user_id: int):
     if not is_super_owner(user_id):
         await query.answer("غير مصرح.", show_alert=True)
         return
+    _clear_awaiting_flags(context)
     context.user_data["_awaiting_global_search"] = True
     keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("❌ إلغاء", callback_data=build_cb("devpanel"))]])
     await query.edit_message_text(
@@ -882,6 +916,7 @@ async def start_local_search_flow(query, context, user_id: int, channel_id: int)
     if not can_manage_channel(user_id, channel_id):
         await query.answer("غير مصرح لك بإدارة هذه القناة.", show_alert=True)
         return
+    _clear_awaiting_flags(context)
     context.user_data["_awaiting_local_search_for"] = channel_id
     keyboard = build_back_to_channel_button(channel_id)
     await query.edit_message_text(
@@ -1045,6 +1080,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not can_manage_channel(user_id, channel_id):
             await query.answer("غير مصرح لك بإدارة هذه القناة.", show_alert=True)
             return
+        _clear_awaiting_flags(context)
         context.user_data["_awaiting_wladd_for"] = channel_id
         await context.bot.send_message(
             user_id,
@@ -1059,6 +1095,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not can_manage_channel(user_id, channel_id):
             await query.answer("غير مصرح لك بإدارة هذه القناة.", show_alert=True)
             return
+        _clear_awaiting_flags(context)
         context.user_data["_awaiting_welcome_photo_for"] = channel_id
         await context.bot.send_message(user_id, "📸 أرسل الآن الصورة التي تريد تعيينها كصورة ترحيب لهذه القناة:")
         return
@@ -1068,6 +1105,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not is_super_owner(user_id):
             await query.answer("غير مصرح.", show_alert=True)
             return
+        _clear_awaiting_flags(context)
         context.user_data["_awaiting_default_welcome_photo"] = True
         await context.bot.send_message(user_id, "📸 أرسل الآن الصورة الافتراضية لكل القنوات التي لم تحدد صورة خاصة بها:")
         return
@@ -1609,6 +1647,13 @@ async def cmd_ban_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------------------
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    if isinstance(context.error, Conflict):
+        logger.error(
+            "تعارض (Conflict): فيه أكتر من نسخة شغالة بنفس BOT_TOKEN في نفس الوقت "
+            "(تأكد إن عدد الـ replicas في إعدادات Railway = 1 بالظبط، ومفيش نسخة تانية "
+            "للبوت شغالة محلياً). التفاصيل: %s", context.error,
+        )
+        return
     logger.error("استثناء غير متوقع أثناء معالجة Update:", exc_info=context.error)
 
 
